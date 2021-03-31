@@ -656,41 +656,14 @@ void ReachDFFwk::collapse(DFRegion *R) {
     // which get values outside the loop or from previous loop iterations.
     // These locations can not be privatized.
     for (auto &Loc : DU->getUses()) {
-      bool StartInLoop = false, EndInLoop = false;
-      auto *EM = AT.find(Loc);
-      EM = EM->getTopLevelParent();
-      auto *V = EM->front();
-      // We're looking for alloca->bitcast->lifetime.start/end instructions
-      // in loops to exclude arrays that can be marked private
-      if (auto *AI = dyn_cast<AllocaInst>(V)) {
-        for (auto *V1 : AI->users()) {
-          if (auto *BC = dyn_cast<BitCastInst>(V1)) {
-            for (auto *V2 : BC->users()) {
-              if (auto *II = dyn_cast<IntrinsicInst>(V2)) {
-                auto *BB = II->getParent();
-                if (auto *DFL = dyn_cast<DFLoop>(R)) {
-                  auto *L = DFL->getLoop();
-                  if (L->contains(BB)) {
-                    auto ID = II->getIntrinsicID();
-                    if (!StartInLoop &&
-                        ID == llvm::Intrinsic::lifetime_start) {
-                      StartInLoop = true;
-                    } else if (!EndInLoop &&
-                               ID == llvm::Intrinsic::lifetime_end) {
-                      EndInLoop = true;
-                    }
-                    if (StartInLoop && EndInLoop)
-                      break;
-                  }
-                }
-              }
-            }
-          }
-          if (StartInLoop && EndInLoop)
-            break;
-        }
+      if (auto *DFL{dyn_cast<DFLoop>(R)}) {
+        auto *EM{AT.find(Loc)};
+        assert(EM && "Estimate memory must not be null!");
+        EM = EM->getTopLevelParent();
+        if (pointsToLocalMemory(*EM->front(), *DFL->getLoop()))
+          continue;
       }
-      if (!RS->getIn().MustReach.contain(Loc) && !(StartInLoop && EndInLoop))
+      if (!RS->getIn().MustReach.contain(Loc))
         DefUse->addUse(Loc);
     }
     // It is possible that some locations are only written in the loop.
