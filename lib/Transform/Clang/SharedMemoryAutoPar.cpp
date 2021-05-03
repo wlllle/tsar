@@ -28,6 +28,7 @@
 #include "tsar/Analysis/Clang/ASTDependenceAnalysis.h"
 #include "tsar/Analysis/Clang/CanonicalLoop.h"
 #include "tsar/Analysis/Clang/DIMemoryMatcher.h"
+#include "tsar/Analysis/Clang/ExpressionMatcher.h"
 #include "tsar/Analysis/Clang/LoopMatcher.h"
 #include "tsar/Analysis/Clang/MemoryMatcher.h"
 #include "tsar/Analysis/Clang/PerfectLoop.h"
@@ -37,7 +38,9 @@
 #include "tsar/Analysis/Memory/DIDependencyAnalysis.h"
 #include "tsar/Analysis/Memory/DIEstimateMemory.h"
 #include "tsar/Analysis/Memory/DIMemoryTrait.h"
+#include "tsar/Analysis/Memory/EstimateMemory.h"
 #include "tsar/Analysis/Memory/MemoryTraitUtils.h"
+#include "tsar/Analysis/Memory/PassAAProvider.h"
 #include "tsar/Analysis/Memory/Passes.h"
 #include "tsar/Analysis/Parallel/Parallellelization.h"
 #include "tsar/Analysis/Parallel/ParallelLoop.h"
@@ -45,7 +48,6 @@
 #include "tsar/Frontend/Clang/TransformationContext.h"
 #include "tsar/Support/Clang/Diagnostic.h"
 #include "tsar/Support/GlobalOptions.h"
-#include "tsar/Support/PassAAProvider.h"
 #include "tsar/Transform/Clang/Passes.h"
 #include "tsar/Transform/IR/InterprocAttr.h"
 #include <bcl/marray.h>
@@ -56,6 +58,8 @@
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Analysis/CallGraphSCCPass.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/PostDominators.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Verifier.h>
 #include <algorithm>
 
@@ -94,6 +98,17 @@ void ClangSMParallelizationInfo::addAfterPass(
   Passes.add(createAnalysisCloseConnectionPass());
 }
 
+bool ClangSMParallelization::optimizeUpward(Loop &L,
+    const FunctionAnalysis &Provider) {
+  bool Optimize = true;
+  auto &F = *L.getHeader()->getParent();
+  if (!mRegions.empty() &&
+      std::none_of(mRegions.begin(), mRegions.end(),
+        [&L](const OptimizationRegion *R) { return R->contain(L); }))
+     Optimize = false;
+  return optimizeUpward(&L, L.begin(), L.end(), Provider, Optimize);
+}
+
 bool ClangSMParallelization::findParallelLoops(Loop &L,
     const FunctionAnalysis &Provider, ParallelItem *PI) {
   auto &F = *L.getHeader()->getParent();
@@ -120,12 +135,12 @@ bool ClangSMParallelization::findParallelLoops(Loop &L,
   auto LMatchItr = LM.find<IR>(&L);
   if (LMatchItr != LM.end())
     toDiag(Diags, LMatchItr->get<AST>()->getBeginLoc(),
-           clang::diag::remark_parallel_loop);
+           tsar::diag::remark_parallel_loop);
   auto DFL = cast<DFLoop>(RI.getRegionFor(&L));
   auto CanonicalItr = CL.find_as(DFL);
   if (CanonicalItr == CL.end() || !(**CanonicalItr).isCanonical()) {
     toDiag(Diags, LMatchItr->get<AST>()->getBeginLoc(),
-           clang::diag::warn_parallel_not_canonical);
+           tsar::diag::warn_parallel_not_canonical);
     if (PI)
       PI->finalize();
     if (!PI || PI && PI->isChildPossible())
@@ -181,9 +196,10 @@ bool ClangSMParallelization::findParallelLoops(Loop &L,
         mParallelCallees.try_emplace(Callee, mAdjacentList[Callee].get<Id>());
       }
   }
-  if (!PI || PI && !PI->isFinal())
-    return findParallelLoops(&L, L.begin(), L.end(), Provider, PI);
-  return PI;
+  bool Parallelized{PI != nullptr};
+  if (!PI || !PI->isFinal())
+    Parallelized |= findParallelLoops(&L, L.begin(), L.end(), Provider, PI);
+  return Parallelized;
 }
 
 void ClangSMParallelization::initializeProviderOnClient() {
@@ -311,6 +327,10 @@ static void addToReachability(const AdjacentListT &AdjacentList,
 
 bool ClangSMParallelization::runOnModule(Module &M) {
   releaseMemory();
+  if (!(mEntryPoint = M.getFunction("main")))
+    mEntryPoint = M.getFunction("MAIN_");
+  // TODO (kaniandr@gmail.com): emit warning if entry point has not be found
+  // TODO (kaniandr@gmail.com): add option to manually specify entry point
   auto &TfmInfoPass{ getAnalysis<TransformationEnginePass>() };
   mTfmInfo = TfmInfoPass ? &TfmInfoPass.get() : nullptr;
   mTfmCtx = mTfmInfo ? mTfmInfo->getContext(M) : nullptr;
@@ -335,7 +355,7 @@ bool ClangSMParallelization::runOnModule(Module &M) {
         mRegions.push_back(R);
       else
         toDiag(mTfmCtx->getContext().getDiagnostics(),
-               clang::diag::warn_region_not_found) << Name;
+               tsar::diag::warn_region_not_found) << Name;
   }
   auto NumberOfSCCs = buildAdjacentList();
   bcl::marray<bool, 2> Reachability({NumberOfSCCs, NumberOfSCCs});
@@ -393,6 +413,43 @@ bool ClangSMParallelization::runOnModule(Module &M) {
     auto &LI = Provider.value<LoopInfoWrapperPass *>()->getLoopInfo();
     findParallelLoops(F, LI.begin(), LI.end(), Provider, nullptr);
   }
+  for (auto &[F, Node] : mAdjacentList) {
+    if (Node.get<InCycle>() || !F || F->isIntrinsic() || F->isDeclaration() ||
+        hasFnAttr(*F, AttrKind::LibFunc))
+      continue;
+    bool Optimize{true}, OptimizeChildren{true};
+    if (!mRegions.empty()) {
+      Optimize = OptimizeChildren = false;
+      for (const auto *R : mRegions) {
+        switch (R->contain(*F)) {
+          case OptimizationRegion::CS_No:
+          continue;
+          case OptimizationRegion::CS_Always:
+          case OptimizationRegion::CS_Condition:
+            Optimize = true;
+            [[fallthrough]];
+          case OptimizationRegion::CS_Child:
+            OptimizeChildren = true;
+            break;
+          default:
+            llvm_unreachable("Unkonwn region contain status!");
+        }
+        if (Optimize)
+          break;
+      }
+    }
+    if (!OptimizeChildren)
+      continue;
+    if (mParallelCallees.count(F) ||
+        llvm::any_of(mParallelCallees,
+                     [&Node, &Reachability](const auto &Parallel) {
+                       return Reachability[Parallel.second][Node.get<Id>()];
+                     }))
+      continue;
+    auto Provider{analyzeFunction(*F)};
+    auto &LI{Provider.value<LoopInfoWrapperPass *>()->getLoopInfo()};
+    optimizeUpward(F, LI.begin(), LI.end(), Provider, Optimize);
+  }
   return false;
 }
 
@@ -427,4 +484,3 @@ INITIALIZE_PROVIDER(ClangSMParallelProvider,
 ClangSMParallelization::ClangSMParallelization(char &ID) : ModulePass(ID) {
   initializeClangSMParallelProviderPass(*PassRegistry::getPassRegistry());
 }
-

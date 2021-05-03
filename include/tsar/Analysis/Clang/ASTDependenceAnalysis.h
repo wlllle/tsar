@@ -40,8 +40,11 @@ class ClangDependenceAnalyzer {
 public:
   using ClangDIMemoryMatcher = llvm::ClangDIMemoryMatcherPass::DIMemoryMatcher;
 
-  /// Sorted list of variables (to print their in algoristic order).
-  using SortedVarListT = std::set<std::string, std::less<std::string>>;
+  using VariableT = VariableCollector::VariableT;
+  using VariableLess = VariableCollector::VariableLess;
+
+  using SortedVarListT = VariableCollector::SortedVarListT;
+  using SortedVarMultiListT = VariableCollector::SortedVarMultiListT;
 
   /// List of dependence distances.
   using DistanceInfo = bcl::tagged_tuple<
@@ -51,7 +54,7 @@ public:
   /// Sorted list of variables with dependence distances (flow and anti)
   /// attached to them.
   using SortedVarDistanceT =
-      std::map<std::string, DistanceInfo, std::less<std::string>>;
+      std::map<VariableT, DistanceInfo, VariableLess>;
 
   /// Lists of reduction variables.
   using ReductionVarListT =
@@ -66,7 +69,7 @@ public:
                         bcl::tagged<SortedVarListT, trait::WriteOccurred>,
                         bcl::tagged<ReductionVarListT, trait::Reduction>,
                         bcl::tagged<SortedVarDistanceT, trait::Dependence>,
-                        bcl::tagged<std::string, trait::Induction>>;
+                        bcl::tagged<VariableT, trait::Induction>>;
 
   ClangDependenceAnalyzer(clang::Stmt *Region, const GlobalOptions &GO,
       clang::DiagnosticsEngine &Diags, DIAliasTree &DIAT,
@@ -76,10 +79,11 @@ public:
       mDIDepSet(DIDepSet), mDIMemoryMatcher(DIMemoryMatcher),
       mASTToClient(ASTToClient) {
     assert(Region && "Source-level region must not be null!");
+    mDependenceInfo.get<trait::Induction>() = { nullptr, nullptr };
   }
 
   bool evaluateDependency();
-  bool evaluateDefUse();
+  bool evaluateDefUse(SortedVarMultiListT *Errors = nullptr);
 
   const ASTRegionTraitInfo & getDependenceInfo() const noexcept {
     return mDependenceInfo;

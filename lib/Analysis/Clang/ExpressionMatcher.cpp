@@ -25,12 +25,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "tsar/Analysis/Clang/ExpressionMatcher.h"
+#include "tsar/Analysis/KnownFunctionTraits.h"
+#include "tsar/Analysis/PrintUtils.h"
 #include "tsar/Analysis/Clang/Matcher.h"
+#include "tsar/Core/Query.h"
 #include "tsar/Frontend/Clang/TransformationContext.h"
+#include "tsar/Support/GlobalOptions.h"
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 
 using namespace llvm;
 using namespace tsar;
@@ -45,7 +50,7 @@ STATISTIC(NumNonMatchASTExpr, "Number of non-matched AST expressions");
 
 namespace {
 class MatchExprVisitor :
-  public MatchASTBase<Value *, Stmt *>,
+  public MatchASTBase<Value *, DynTypedNode>,
   public RecursiveASTVisitor<MatchExprVisitor> {
 public:
   MatchExprVisitor(SourceManager &SrcMgr, Matcher &MM,
@@ -54,38 +59,191 @@ public:
 
   /// Evaluates declarations expanded from a macro and stores such
   /// declaration into location to macro map.
-  void VisitFromMacro(Stmt *S) {
-    assert(S->getBeginLoc().isMacroID() &&
-      "Expression must be expanded from macro!");
-    auto Loc = S->getBeginLoc();
+  void VisitFromMacro(DynTypedNode &&N, SourceLocation Loc) {
+    assert(Loc.isMacroID() && "Expression must be expanded from macro!");
     if (Loc.isInvalid())
       return;
     Loc = mSrcMgr->getExpansionLoc(Loc);
     if (Loc.isInvalid())
       return;
-    auto Pair = mLocToMacro->insert(
-      std::make_pair(Loc.getRawEncoding(), TinyPtrVector<Stmt *>(S)));
-    if (!Pair.second)
-      Pair.first->second.push_back(S);
+    auto I{mLocToMacro->try_emplace(Loc.getRawEncoding()).first};
+    I->second.push_back(std::move(N));
   }
 
-   bool VisitCallExpr(Expr *E) {
-    if (E->getBeginLoc().isMacroID()) {
-      VisitFromMacro(E);
-      return true;
-    }
-    auto ExprLoc = E->getBeginLoc();
-    if (auto *I = findIRForLocation(ExprLoc)) {
-      mMatcher->emplace(E, I);
+  void VisitItem(DynTypedNode &&N, SourceLocation Loc) {
+    LLVM_DEBUG(dbgs() << "[EXPR MATCHER]: match at ";
+               Loc.print(dbgs(), *mSrcMgr); dbgs() << "\n");
+    if (Loc.isMacroID()) {
+      VisitFromMacro(std::move(N), Loc);
+    } else if (auto *I = findIRForLocation(Loc)) {
+      mMatcher->emplace(std::move(N), I);
       ++NumMatchExpr;
       --NumNonMatchIRExpr;
     } else {
-      mUnmatchedAST->insert(E);
+      mUnmatchedAST->insert(std::move(N));
       ++NumNonMatchASTExpr;
     }
-    return true;
   }
+
+  bool VisitVarDecl(VarDecl *D) {
+    LLVM_DEBUG(dbgs() << "[EXPR MATCHER]: visit " << D->getDeclKindName()
+                      << D->getName() << "\n");
+    VisitItem(DynTypedNode::create(*D), D->getLocation());
+    return true;    
+  }
+
+  bool TraverseStmt(Stmt *S) {
+    struct StashParent {
+      StashParent(Stmt *S, SmallVectorImpl<Stmt *> &Ps) : Parents(Ps) {
+        Parents.push_back(S);
+      }
+      ~StashParent() { Parents.pop_back(); }
+      SmallVectorImpl<Stmt *> &Parents;
+    };
+    if (!S)
+      return true;
+    LLVM_DEBUG(dbgs() << "[EXPR MATCHER]: visit " << S->getStmtClassName()
+                      << "\n");
+    if (auto CE = dyn_cast<CallExpr>(S)) {
+      if (!CE->getDirectCallee()) {
+        StashParent [[maybe_unused]] Stash{CE->getCallee(), mParents};
+        // We match expression which computes callee before this call.
+        if (!TraverseStmt(CE->getCallee()))
+          return false;
+      }
+      VisitItem(DynTypedNode::create(*S), S->getBeginLoc());
+      for (auto Arg : CE->arguments()) {
+        StashParent [[maybe_unused]] Stash{Arg, mParents};
+        if (!TraverseStmt(Arg))
+          return false;
+      }
+      return true;
+    }
+    if (auto *U{dyn_cast<UnaryExprOrTypeTraitExpr>(S)};
+        U && U->isArgumentType()) {
+      // If the statement is sizeof(int[M][K]), references to M and K are
+      // visited twice, so we traverse them manually to avoid double matching.
+      if (auto *T{
+              dyn_cast<VariableArrayType>(U->getArgumentType().getTypePtr())}) {
+        for (auto *C : U->children()) {
+          StashParent [[maybe_unused]] Stash{C, mParents};
+          if (!TraverseStmt(C))
+            return false;
+        }
+        return true;
+      }
+    }
+    if (auto *SE{dyn_cast<ArraySubscriptExpr>(S)}) {
+      {
+        // We use scope to reload stash on exit.
+        StashParent [[maybe_unused]] Stash{S, mParents};
+        if (!RecursiveASTVisitor::TraverseStmt(S))
+          return false;
+      }
+      auto [InArraySubscriptBase, InStore] = isInArraySubscriptBaseAndStore(S);
+      // Match current statement if it is an innermost array subscript
+      // expression. Note, that assignment-like expressions have been already
+      // matched.
+      if (!mHasChildArraySubscript && !InStore)
+        VisitItem(DynTypedNode::create(*SE), SE->getExprLoc());
+      mHasChildArraySubscript = InArraySubscriptBase;
+      return true;
+    }
+    if (auto UO = dyn_cast<clang::UnaryOperator>(S);
+        UO && (UO->isPrefix() || UO->isPostfix())) {
+      // Match order: `load` then `store`. Note, that `load` and `store` have
+      // the same location in a source code.
+      // For `++ <expr>` we match `++` with store and `<expr>` with load.
+      VisitItem(DynTypedNode::create(*UO->getSubExpr()), UO->getOperatorLoc());
+      VisitItem(DynTypedNode::create(*S), UO->getOperatorLoc());
+      StashParent [[maybe_unused]] Stash{UO->getSubExpr(), mParents};
+      return TraverseStmt(UO->getSubExpr());
+    }
+    if (auto DRE{dyn_cast<DeclRefExpr>(S)}) {
+      // There is no load from pointer if the variable has an array type.
+      // We do not match reference to the array name to avoid multiple match
+      // with a single `load` instruction (ArraySubscriptExpr must be matched
+      // only).
+      if (auto VD{dyn_cast<VarDecl>(DRE->getDecl())};
+          VD && isa<clang::ArrayType>(VD->getType()) &&
+          isInArraySubscriptBaseAndStore(S).first)
+        return true;
+    }
+    if (isa<ReturnStmt>(S) || isa<DeclRefExpr>(S) ||
+        isa<clang::UnaryOperator>(S) &&
+            cast<clang::UnaryOperator>(S)->getOpcode() ==
+                clang::UnaryOperatorKind::UO_Deref) {
+      VisitItem(DynTypedNode::create(*S), S->getBeginLoc());
+    } else if (auto BO = dyn_cast<clang::BinaryOperator>(S);
+             BO && BO->isAssignmentOp()) {
+      // In case of compound assignment (for example,  +=) match load at first.
+      if (BO->isCompoundAssignmentOp())
+        VisitItem(DynTypedNode::create(*BO->getLHS()), BO->getExprLoc());
+      VisitItem(DynTypedNode::create(*S), BO->getExprLoc());
+    } else if (auto *ME = dyn_cast<MemberExpr>(S)) {
+      VisitItem(DynTypedNode::create(*S), ME->getMemberLoc());
+    }
+    StashParent [[maybe_unused]] Stash{S, mParents};
+    return RecursiveASTVisitor::TraverseStmt(S);
+  }
+
+private:
+  std::pair<bool, bool> isInArraySubscriptBaseAndStore(const Stmt *S) {
+    auto *Prev{S};
+    bool IsInArraySubscriptBase{false};
+    for (auto *P : reverse(mParents)) {
+      if (auto *SE{dyn_cast<ArraySubscriptExpr>(P)}) {
+        if (SE->getBase() != Prev)
+          return std::pair{IsInArraySubscriptBase, false};
+        IsInArraySubscriptBase = true;
+      } else {
+        if (auto BO{ dyn_cast<clang::BinaryOperator>(P) };
+          BO && BO->isAssignmentOp() && BO->getLHS() == Prev)
+          return std::pair{ IsInArraySubscriptBase, true };
+        if (auto UO{ dyn_cast<clang::UnaryOperator>(P) };
+          UO && (UO->isPrefix() || UO->isPostfix()))
+          return std::pair{ IsInArraySubscriptBase, true };
+        if (!isa<CastExpr>(P))
+          return std::pair{ IsInArraySubscriptBase, false };
+      }
+      Prev = P;
+    }
+    return std::pair{IsInArraySubscriptBase, false};
+  }
+
+  SmallVector<Stmt *, 8> mParents;
+  bool mHasChildArraySubscript{false};
 };
+}
+
+void ClangExprMatcherPass::print(raw_ostream &OS, const llvm::Module *M) const {
+  if (mMatcher.empty())
+    return;
+  auto &GO = getAnalysis<GlobalOptionsImmutableWrapper>().getOptions();
+  auto &TfmInfo = getAnalysis<TransformationEnginePass>();
+  auto TfmCtx = TfmInfo->getContext(*const_cast<Module *>(M));
+  auto &SrcMgr = TfmCtx->getRewriter().getSourceMgr();
+  for (auto &Match : mMatcher) {
+    tsar::print(OS, cast<Instruction>(Match.get<IR>())->getDebugLoc(),
+                GO.PrintFilenameOnly);
+    if (auto *S{Match.get<AST>().get<Stmt>()}) {
+      OS << " ";
+      OS << S->getStmtClassName();
+      if (auto UO{ dyn_cast<clang::UnaryOperator>(S) })
+        OS << " '" << clang::UnaryOperator::getOpcodeStr(UO->getOpcode())
+           << "'";
+      else if (auto BO{ dyn_cast<clang::BinaryOperator>(S) })
+        OS << " '" << clang::BinaryOperator::getOpcodeStr(BO->getOpcode())
+           << "'";
+    } else if (auto * D{ Match.get<AST>().get<Decl>() }) {
+      OS << " ";
+      OS << D->getDeclKindName();
+      if (auto ND{ dyn_cast<NamedDecl>(D) })
+        OS << " '" << ND->getName() << "'";
+    }
+    Match.get<IR>()->print(OS);
+    OS << "\n";
+  }
 }
 
 bool ClangExprMatcherPass::runOnFunction(Function &F) {
@@ -102,15 +260,18 @@ bool ClangExprMatcherPass::runOnFunction(Function &F) {
   MatchExprVisitor MatchExpr(SrcMgr,
     mMatcher, mUnmatchedAST, LocToExpr, LocToMacro);
   for (auto &I: instructions(F)) {
-    if (!isa<CallBase>(I))
+    if (auto II = llvm::dyn_cast<IntrinsicInst>(&I);
+        II && (isDbgInfoIntrinsic(II->getIntrinsicID()) ||
+               isMemoryMarkerIntrinsic(II->getIntrinsicID())))
+      continue;
+    if (!isa<CallBase>(I) && !isa<LoadInst>(I) && !isa<StoreInst>(I) &&
+        !isa<ReturnInst>(I))
       continue;
     ++NumNonMatchIRExpr;
     auto Loc = I.getDebugLoc();
     if (Loc) {
-      auto Pair = LocToExpr.insert(
-        std::make_pair(Loc, TinyPtrVector<Value *>(&I)));
-      if (!Pair.second)
-        Pair.first->second.push_back(&I);
+      auto Itr{ LocToExpr.try_emplace(Loc).first };
+      Itr->second.push_back(&I);
     }
   }
   for (auto &Pair : LocToExpr)
@@ -121,22 +282,27 @@ bool ClangExprMatcherPass::runOnFunction(Function &F) {
   if (!FuncDecl)
     return false;
   MatchExpr.TraverseDecl(FuncDecl);
-  MatchExpr.matchInMacro(NumMatchExpr, NumNonMatchASTExpr, NumNonMatchIRExpr);
+  MatchExpr.matchInMacro(NumMatchExpr, NumNonMatchASTExpr, NumNonMatchIRExpr,
+                         true);
   return false;
 }
 
 void ClangExprMatcherPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<TransformationEnginePass>();
+  AU.addRequired<GlobalOptionsImmutableWrapper>();
   AU.setPreservesAll();
 }
 
 char ClangExprMatcherPass::ID = 0;
 
-INITIALIZE_PASS_BEGIN(ClangExprMatcherPass, "clang-expr-matcher",
-  "High and Low Expression Matcher", false , true)
+INITIALIZE_PASS_IN_GROUP_BEGIN(ClangExprMatcherPass, "clang-expr-matcher",
+  "High and Low Expression Matcher", false , true,
+  DefaultQueryManager::PrintPassGroup::getPassRegistry())
   INITIALIZE_PASS_DEPENDENCY(TransformationEnginePass)
-INITIALIZE_PASS_END(ClangExprMatcherPass, "clang-expr-matcher",
-  "High and Low Level Expression Matcher", false, true)
+  INITIALIZE_PASS_DEPENDENCY(GlobalOptionsImmutableWrapper)
+INITIALIZE_PASS_IN_GROUP_END(ClangExprMatcherPass, "clang-expr-matcher",
+  "High and Low Level Expression Matcher", false, true,
+  DefaultQueryManager::PrintPassGroup::getPassRegistry())
 
 FunctionPass * llvm::createClangExprMatcherPass() {
   return new ClangExprMatcherPass;

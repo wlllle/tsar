@@ -56,13 +56,11 @@ bool VariableCollector::VisitDeclRefExpr(clang::DeclRefExpr *DRE) {
   assert(ND && "Declaration must not be null!");
   if (isa<clang::VarDecl>(ND)) {
     auto *VD = cast<clang::VarDecl>(ND->getCanonicalDecl());
-    if (!Induction)
-      Induction = VD;
     auto T = getCanonicalUnqualifiedType(VD);
     unsigned PtrTpNum = numberOfPointerTypes(T);
     if (PtrTpNum == 0 && VD->getType().isConstQualified())
       return true;
-    CanonicalRefs.try_emplace(VD).first->second.resize(PtrTpNum + 1, nullptr);
+    CanonicalRefs.try_emplace(VD).first->second.resize(PtrTpNum + 1);
   }
   return true;
 }
@@ -74,27 +72,47 @@ bool VariableCollector::VisitDeclStmt(clang::DeclStmt *DS) {
   return true;
 }
 
-std::pair<clang::VarDecl *, VariableCollector::DeclSearch>
+bool VariableCollector::TraverseLoopIteration(clang::ForStmt *For) {
+  assert(For && "Statement must not be null!");
+  for (auto *Child : For->children()) {
+    if (!Child)
+      continue;
+    if (Child == For->getInit()) {
+      if (auto DS{dyn_cast<DeclStmt>(Child)})
+        if (!VisitDeclStmt(DS))
+          return false;
+    } else if (!TraverseStmt(Child)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::tuple<clang::VarDecl *, DIMemory *, VariableCollector::DeclSearch>
 VariableCollector::findDecl(const DIMemory &DIM,
     const DIMemoryMatcher &ASTToClient,
     const ClonedDIMemoryMatcher &ClientToServer) {
   auto *M = const_cast<DIMemory *>(&DIM);
   if (auto *DIEM = dyn_cast<DIEstimateMemory>(M)) {
     auto CSMemoryItr = ClientToServer.find<Clone>(DIEM);
-    assert(CSMemoryItr != ClientToServer.end() &&
-           "Metadata-level memory must exist on on client!");
+    // Transformation of LLVM IR may introduce some new lower-level memory'
+    // locations in the alias tree, which subsequently implies
+    // new metadata-level memory locations.
+    if (CSMemoryItr == ClientToServer.end())
+      return std::tuple(nullptr, nullptr, Unknown);
     auto *DIVar =
         cast<DIEstimateMemory>(CSMemoryItr->get<Origin>())->getVariable();
     assert(DIVar && "Variable must not be null!");
     auto MatchItr = ASTToClient.find<MD>(DIVar);
     if (MatchItr == ASTToClient.end())
       if (isStubVariable(*DIVar))
-          return std::make_pair(nullptr, Unknown);
+          return std::tuple(nullptr, nullptr, Unknown);
       else
-        return std::make_pair(nullptr, Invalid);
+        return std::tuple(nullptr, nullptr, Invalid);
     auto ASTRefItr = CanonicalRefs.find(MatchItr->get<AST>());
     if (ASTRefItr == CanonicalRefs.end())
-      return std::make_pair(MatchItr->get<AST>(), Implicit);
+      return std::tuple(MatchItr->get<AST>(), CSMemoryItr->get<Origin>(),
+                        Implicit);
     if (DIEM->getExpression()->getNumElements() > 0) {
       auto *Expr = DIEM->getExpression();
       auto NumDeref = llvm::count(Expr->getElements(), dwarf::DW_OP_deref);
@@ -107,12 +125,33 @@ VariableCollector::findDecl(const DIMemory &DIM,
       if (NumDeref == 0 && ASTRefItr->second.size() == 1 &&
           Expr->isFragment() && Expr->getNumElements() == 3 &&
           !DIEM->isSized()) {
-        ASTRefItr->second.front() = DIEM;
-        return std::make_pair(MatchItr->get<AST>(), isa<DILocalVariable>(DIVar)
-                                                        ? CoincideLocal
-                                                        : CoincideGlobal);
+        ASTRefItr->second.front() = {DIEM, DK_Strong};
+        return std::tuple(MatchItr->get<AST>(), CSMemoryItr->get<Origin>(),
+                          isa<DILocalVariable>(DIVar) ? CoincideLocal
+                                                      : CoincideGlobal);
       }
       auto *T = getCanonicalUnqualifiedType(ASTRefItr->first);
+      auto isZeroOffsets = [](DIExpression *Expr) {
+        // Now we check whether all offsets are zero. On success,
+        // this means that all possible offsets are represented by
+        // the template memory location DIEM.
+        for (auto &Op : Expr->expr_ops())
+          switch (Op.getOp()) {
+          default:
+            llvm_unreachable("Unsupported kind of operand!");
+            return false;
+          case dwarf::DW_OP_deref:
+            break;
+          case dwarf::DW_OP_LLVM_fragment:
+          case dwarf::DW_OP_constu:
+          case dwarf::DW_OP_plus_uconst:
+          case dwarf::DW_OP_plus:
+          case dwarf::DW_OP_minus:
+            if (Op.getArg(0) != 0)
+              return false;
+          }
+        return true;
+      };
       // We want to be sure that current memory location describes all
       // possible memory locations which can be represented with a
       // corresponding variable and a specified number of its dereferences.
@@ -123,70 +162,60 @@ VariableCollector::findDecl(const DIMemory &DIM,
       //   `int (*A)[10]` (0 deref and 1 deref respectively).
       // - <A,8>, <*A,?>, <*A[?],?> are sufficient to represent all memory
       //   defined by `int **A` (0, 1 and 2 deref respectively).
-      if (NumDeref < ASTRefItr->second.size() && !DIEM->isSized())
-        if ((NumDeref == 1 && (NumDeref == Expr->getNumElements() ||
-                               Expr->isFragment() &&
-                                   NumDeref == Expr->getNumElements() - 3)) ||
-            (DIEM->isTemplate() && [](DIExpression *Expr) {
-              // Now we check whether all offsets are zero. On success,
-              // this means that all possible offsets are represented by
-              // the template memory location DIEM.
-              for (auto &Op : Expr->expr_ops())
-                switch (Op.getOp()) {
-                default:
-                  llvm_unreachable("Unsupported kind of operand!");
-                  return false;
-                case dwarf::DW_OP_deref:
-                  break;
-                case dwarf::DW_OP_LLVM_fragment:
-                case dwarf::DW_OP_constu:
-                case dwarf::DW_OP_plus_uconst:
-                case dwarf::DW_OP_plus:
-                case dwarf::DW_OP_minus:
-                  if (Op.getArg(0) == 0)
-                    return false;
-                }
-            }(Expr)))
-          ASTRefItr->second[NumDeref] = DIEM;
-      return std::make_pair(MatchItr->get<AST>(), Derived);
+      if (NumDeref < ASTRefItr->second.size()) {
+        if (!DIEM->isSized()) {
+          if ((NumDeref == 1 && (NumDeref == Expr->getNumElements() ||
+                                Expr->isFragment() &&
+                                    NumDeref == Expr->getNumElements() - 3)) ||
+            (DIEM->isTemplate() && isZeroOffsets(Expr)))
+          ASTRefItr->second[NumDeref] = {DIEM, DK_Strong};
+        } else if (Expr->isFragment() && isZeroOffsets(Expr)) {
+          ASTRefItr->second[NumDeref] = {DIEM, DK_Bounded};
+        } else {
+          ASTRefItr->second[NumDeref].Memory.push_back(DIEM);
+          ASTRefItr->second[NumDeref].Kind = DK_Partial;
+        }
+      }
+      return std::tuple(MatchItr->get<AST>(), CSMemoryItr->get<Origin>(),
+                        Derived);
     }
-    ASTRefItr->second.front() = DIEM;
-    return std::make_pair(MatchItr->get<AST>(), isa<DILocalVariable>(DIVar)
-                                                    ? CoincideLocal
-                                                    : CoincideGlobal);
+    ASTRefItr->second.front() = {DIEM, DK_Strong};
+    return std::tuple(MatchItr->get<AST>(), CSMemoryItr->get<Origin>(),
+                      isa<DILocalVariable>(DIVar) ? CoincideLocal
+                                                  : CoincideGlobal);
   }
   if (cast<DIUnknownMemory>(M)->isDistinct())
-    return std::make_pair(nullptr, Unknown);
-  return std::make_pair(nullptr, Useless);
+    return std::tuple(nullptr, nullptr, Unknown);
+  return std::tuple(nullptr, nullptr, Useless);
 }
 
 bool VariableCollector::localize(DIAliasTrait &TS,
               const DIMemoryMatcher &ASTToClient,
               const ClonedDIMemoryMatcher &ClientToServer,
-              SortedVarListT &VarNames, clang::VarDecl **Error) {
+              SortedVarListT &VarNames, SortedVarMultiListT *Error) {
+  bool IsOk{true};
   for (auto &T : TS)
-    if (!localize(*T, *TS.getNode(),
-          ASTToClient, ClientToServer, VarNames, Error))
-      return false;
-  return true;
+    IsOk &= localize(*T, *TS.getNode(), ASTToClient, ClientToServer, VarNames,
+                     Error);
+  return IsOk;
 }
 
 bool VariableCollector::localize(DIMemoryTrait &T, const DIAliasNode &DIN,
     const DIMemoryMatcher &ASTToClient,
     const ClonedDIMemoryMatcher &ClientToServer,
-    SortedVarListT &VarNames, clang::VarDecl **Error) {
+    SortedVarListT &VarNames, SortedVarMultiListT *Error) {
   auto Res = localize(T, DIN, ASTToClient, ClientToServer);
-  if (!std::get<1>(Res)) {
-    if (Error)
-      *Error = std::get<0>(Res);
+  if (!std::get<2>(Res)) {
+    if (Error && std::get<VarDecl *>(Res))
+      Error->emplace(std::get<VarDecl *>(Res), std::get<DIMemory *>(Res));
     return false;
   }
-  if (std::get<0>(Res) && !std::get<2>(Res))
-    VarNames.insert(std::string(std::get<0>(Res)->getName()));
+  if (std::get<VarDecl *>(Res) && !std::get<3>(Res))
+    VarNames.emplace(std::get<VarDecl *>(Res), std::get<DIMemory *>(Res));
   return true;
 }
 
-std::tuple<clang::VarDecl *, bool, bool> VariableCollector::localize(
+std::tuple<clang::VarDecl *, DIMemory*, bool, bool> VariableCollector::localize(
     DIMemoryTrait &T, const DIAliasNode &DIN,
     const DIMemoryMatcher &ASTToClient,
     const ClonedDIMemoryMatcher &ClientToServer) {
@@ -195,15 +224,21 @@ std::tuple<clang::VarDecl *, bool, bool> VariableCollector::localize(
   // these variables are private by default. Moreover, these variables are
   // not visible outside the loop and could not be mentioned in clauses
   // before loop.
-  if (Search.first && CanonicalLocals.count(Search.first))
-    return std::make_tuple(Search.first, true, true);
-  if (Search.second == VariableCollector::CoincideLocal) {
-    return std::make_tuple(Search.first, true, false);
-  } else if (Search.second == VariableCollector::CoincideGlobal) {
-    GlobalRefs.try_emplace(const_cast<DIAliasNode *>(&DIN), Search.first);
-    return std::make_tuple(Search.first, true, false);
-  } else if (Search.second != VariableCollector::Unknown) {
-    return std::make_tuple(Search.first, false, false);
+  if (std::get<VarDecl *>(Search) &&
+      CanonicalLocals.count(std::get<VarDecl *>(Search)))
+    return std::tuple(std::get<VarDecl *>(Search), std::get<DIMemory *>(Search),
+                      true, true);
+  if (std::get<DeclSearch>(Search) == VariableCollector::CoincideLocal) {
+    return std::tuple(std::get<VarDecl *>(Search), std::get<DIMemory *>(Search),
+                      true, false);
+  } else if (std::get<DeclSearch>(Search) == VariableCollector::CoincideGlobal) {
+    GlobalRefs.try_emplace(const_cast<DIAliasNode *>(&DIN),
+                           std::get<VarDecl *>(Search));
+    return std::tuple(std::get<VarDecl *>(Search), std::get<DIMemory *>(Search),
+                      true, false);
+  } else if (std::get<DeclSearch>(Search) != VariableCollector::Unknown) {
+    return std::tuple(std::get<VarDecl *>(Search), std::get<DIMemory *>(Search),
+                      false, false);
   }
-  return std::make_tuple(nullptr, true, false);
+  return std::tuple(nullptr, nullptr, true, false);
 }

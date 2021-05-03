@@ -72,7 +72,7 @@ public:
         return true;
       if (mNewPragma) {
         toDiag(mSrcMgr.getDiagnostics(), mNewPragma->getBeginLoc(),
-          diag::warn_unexpected_directive);
+          tsar::diag::warn_unexpected_directive);
         mActiveRegions.resize(mActiveRegions.size() - mNewActiveRegions);
       }
       SmallVector<Stmt *, 1> Clauses;
@@ -101,7 +101,7 @@ public:
           isa<DoStmt>(S))) {
       if (mNewPragma) {
         toDiag(mSrcMgr.getDiagnostics(), S->getBeginLoc(),
-          diag::warn_unexpected_directive);
+          tsar::diag::warn_unexpected_directive);
         mActiveRegions.resize(mActiveRegions.size() - mNewActiveRegions);
         mNewPragma = nullptr;
       }
@@ -109,45 +109,55 @@ public:
     }
     if (mActiveRegions.empty())
       return RecursiveASTVisitor::TraverseStmt(S);
+    auto StashActivePragmaCount = mActiveRegions.size() - mNewActiveRegions;
     mNewPragma = nullptr;
-    auto StashActivePragmaCount = mActiveRegions.size();
+    mNewActiveRegions = 0;
+    LLVM_DEBUG(
+        dbgs() << "[OPT REGION]: number of active regions on the level entry "
+               << mActiveRegions.size() << "\n");
     if (isa<ForStmt>(S) || isa<WhileStmt>(S) || isa<DoStmt>(S)) {
       auto MatchItr = mLoops.find<AST>(S);
       if (MatchItr == mLoops.end()) {
         toDiag(mSrcMgr.getDiagnostics(), S->getBeginLoc(),
-          diag::warn_region_add_loop_unable);
+          tsar::diag::warn_region_add_loop_unable);
       } else {
         bool AddToRegionError = false;
         for (auto *R : mActiveRegions)
           if (!R->markForOptimization(*MatchItr->get<IR>())) {
             if (!AddToRegionError)
               toDiag(mSrcMgr.getDiagnostics(), S->getBeginLoc(),
-                diag::warn_region_add_loop_unable);
+                tsar::diag::warn_region_add_loop_unable);
             AddToRegionError = true;
           }
       }
     }
     auto Res = RecursiveASTVisitor::TraverseStmt(S);
     mActiveRegions.resize(StashActivePragmaCount);
+    LLVM_DEBUG(
+        dbgs() << "[OPT REGION]: number of active regions on the level exit "
+               << mActiveRegions.size() << "\n");
     return Res;
   }
 
   bool VisitCallExpr(CallExpr *CE) {
     if (mActiveRegions.empty())
       return true;
-    auto MatchItr = mExprs.find<AST>(CE);
+    auto MatchItr = mExprs.find<AST>(DynTypedNode::create(*CE));
     if (MatchItr == mExprs.end()) {
       toDiag(mSrcMgr.getDiagnostics(), CE->getBeginLoc(),
-        diag::warn_region_add_call_unable);
+        tsar::diag::warn_region_add_call_unable);
     } else {
       bool AddToRegionError = false;
-      for (auto *R : mActiveRegions)
+      for (auto *R : mActiveRegions) {
+        LLVM_DEBUG(dbgs() << "[OPT REGION]: add to region ";
+                   TSAR_LLVM_DUMP(MatchItr->get<IR>()->dump()));
         if (!R->markForOptimization(*MatchItr->get<IR>())) {
           if (!AddToRegionError)
             toDiag(mSrcMgr.getDiagnostics(), CE->getBeginLoc(),
-              diag::warn_region_add_call_unable);
+              tsar::diag::warn_region_add_call_unable);
           AddToRegionError = true;
         }
+      }
     }
     return true;
   }

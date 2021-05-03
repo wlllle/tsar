@@ -43,8 +43,40 @@ bool ClangDependenceAnalyzer::evaluateDependency() {
       RedundantCoverage, false);
     RedundantCoverageRef = &RedundantCoverage;
   }
-  mASTVars.TraverseStmt(mRegion);
+  CanonicalDeclPtr<VarDecl> Induction;
+  if (auto *For{dyn_cast<ForStmt>(mRegion)}) {
+    if (auto *DS{dyn_cast_or_null<DeclStmt>(For->getInit())})
+      Induction = cast<VarDecl>(DS->getSingleDecl());
+    else if (auto *BO{dyn_cast_or_null<clang::BinaryOperator>(For->getInit())};
+             BO && BO->isAssignmentOp())
+      if (auto *DRE{dyn_cast<DeclRefExpr>(BO->getLHS())})
+        Induction = dyn_cast<VarDecl>(DRE->getFoundDecl());
+  }
+  if (!Induction) {
+    toDiag(mDiags, mRegion->getBeginLoc(),
+           tsar::diag::warn_parallel_no_induction);
+    return false;
+  }
+  if (auto *For{dyn_cast<ForStmt>(mRegion)})
+    mASTVars.TraverseLoopIteration(For);
+  else
+    mASTVars.TraverseStmt(mRegion);
   DenseSet<DIAliasNode *> DirectSideEffect;
+  using ErrorListT =
+      SmallVector<std::tuple<SortedVarMultiListT, bool,
+                             decltype(diag::PADDING_BUILTIN_TSAR_DIAGNOSTIC)>,
+                  8>;
+  ErrorListT Errors;
+  auto getErrorInfo = [&Errors](auto Diag) -> ErrorListT::reference {
+    auto I{find_if(Errors, [Diag](auto &E) { return std::get<2>(E) == Diag; })};
+    if (I == Errors.end()) {
+      Errors.emplace_back();
+      I = std::prev(Errors.end());
+      std::get<bool>(*I) = false;
+      std::get<2>(*I) = Diag;
+    }
+    return *I;
+  };
   for (auto &TS : mDIDepSet) {
     if (TS.is<trait::DirectAccess>())
       for (auto &T : TS) {
@@ -76,118 +108,109 @@ bool ClangDependenceAnalyzer::evaluateDependency() {
     if (Dptr.is_any<trait::Shared, trait::Readonly>()) {
       /// Remember memory locations for variables for further analysis.
       for (auto &T : TS)
-        auto S =
-            mASTVars.findDecl(*T->getMemory(), mASTToClient, mDIMemoryMatcher);
-        mInToLocalize.push_back(&TS);
+        mASTVars.findDecl(*T->getMemory(), mASTToClient, mDIMemoryMatcher);
+      mInToLocalize.push_back(&TS);
       if (Dptr.is<trait::Shared>())
         mOutToLocalize.push_back(&TS);
     } else if (Dptr.is<trait::Induction>()) {
-      if (TS.size() > 1) {
-        if (!IgnoreRedundant) {
-          toDiag(mDiags, mRegion->getBeginLoc(),
-                 clang::diag::warn_parallel_loop);
-          toDiag(mDiags, mRegion->getBeginLoc(),
-                 clang::diag::note_parallel_multiple_induction);
-          return false;
-        }
-      } else {
-        auto Localized = mASTVars.localize(**TS.begin(), *TS.getNode(),
-                                           mASTToClient, mDIMemoryMatcher);
-        if (!std::get<0>(Localized) || !std::get<1>(Localized) ||
-            std::get<0>(Localized)->getCanonicalDecl() !=
-                mASTVars.Induction->getCanonicalDecl()) {
+      auto &MultipleInduction{
+          getErrorInfo(tsar::diag::note_parallel_multiple_induction)};
+      auto &NotLocalized{
+          getErrorInfo(tsar::diag::note_parallel_localize_induction_unable)};
+      for (auto &I : TS) {
+        auto Localized{mASTVars.localize(*I, *TS.getNode(), mASTToClient,
+                                         mDIMemoryMatcher)};
+        if (!std::get<VarDecl *>(Localized) || !std::get<2>(Localized) ||
+            Induction &&
+                &*Induction !=
+                    std::get<VarDecl *>(Localized)->getCanonicalDecl()) {
           if (!IgnoreRedundant) {
-            toDiag(mDiags, mRegion->getBeginLoc(),
-                   clang::diag::warn_parallel_loop);
-            if (!std::get<1>(Localized)) {
-              toDiag(mDiags,
-                     std::get<0>(Localized)
-                         ? std::get<0>(Localized)->getLocation()
-                         : mRegion->getBeginLoc(),
-                     clang::diag::note_parallel_localize_induction_unable);
+            if (!std::get<2>(Localized)) {
+              std::get<bool>(NotLocalized) = true;
+              if (std::get<VarDecl *>(Localized))
+                std::get<SortedVarMultiListT>(NotLocalized)
+                    .emplace(std::get<VarDecl *>(Localized),
+                             std::get<DIMemory *>(Localized));
             } else {
-              toDiag(mDiags, mASTVars.Induction->getLocation(),
-                     clang::diag::note_parallel_multiple_induction);
-              if (std::get<0>(Localized))
-                toDiag(mDiags, std::get<0>(Localized)->getLocation(),
-                       clang::diag::note_parallel_multiple_induction);
+              std::get<bool>(MultipleInduction) = true;
+              if (Induction)
+                std::get<SortedVarMultiListT>(MultipleInduction)
+                    .emplace(Induction, nullptr);
+              if (std::get<VarDecl *>(Localized))
+                std::get<SortedVarMultiListT>(MultipleInduction)
+                    .emplace(std::get<VarDecl *>(Localized),
+                             std::get<DIMemory *>(Localized));
             }
-            return false;
           }
-        }
-        mDependenceInfo.get<trait::Induction>() =
-            std::string(mASTVars.Induction->getName());
-        if (!std::get<2>(Localized)) {
-          mInToLocalize.push_back(&TS);
-          mOutToLocalize.push_back(&TS);
+        } else {
+          mDependenceInfo.get<trait::Induction>() = {
+              std::get<VarDecl *>(Localized), std::get<DIMemory *>(Localized)};
+          if (!std::get<3>(Localized)) {
+            mInToLocalize.push_back(&TS);
+            mOutToLocalize.push_back(&TS);
+          }
         }
       }
     } else if (Dptr.is<trait::Private>()) {
-      clang::VarDecl *Status = nullptr;
+      auto &Status{
+          getErrorInfo(tsar::diag::note_parallel_localize_private_unable)};
       if (!mASTVars.localize(TS, mASTToClient, mDIMemoryMatcher,
-                             mDependenceInfo.get<trait::Private>(), &Status) &&
-          !IgnoreRedundant) {
-        toDiag(mDiags, mRegion->getBeginLoc(), clang::diag::warn_parallel_loop);
-        toDiag(mDiags, Status ? Status->getLocation() : mRegion->getBeginLoc(),
-          clang::diag::note_parallel_localize_private_unable);
-        return false;
-      }
+                             mDependenceInfo.get<trait::Private>(),
+                             !IgnoreRedundant
+                                 ? &std::get<SortedVarMultiListT>(Status)
+                                 : nullptr) &&
+          !IgnoreRedundant)
+        std::get<bool>(Status) = true;
     } else if (Dptr.is<trait::Reduction>()) {
-      auto I = TS.begin(), EI = TS.end();
-      auto *Red = (**I).get<trait::Reduction>();
+      auto I{TS.begin()}, EI{TS.end()};
+      auto *Red{(**I).get<trait::Reduction>()};
+      auto &UnknownReduction{
+          getErrorInfo(tsar::diag::note_parallel_reduction_unknown)};
+      auto CurrentKind{trait::DIReduction::RK_NoReduction};
       if (!Red || Red->getKind() == trait::DIReduction::RK_NoReduction) {
         if (!IgnoreRedundant) {
-          toDiag(mDiags, mRegion->getBeginLoc(),
-                 clang::diag::warn_parallel_loop);
-          auto Search = mASTVars.findDecl(*(*I)->getMemory(), mASTToClient,
-                                         mDIMemoryMatcher);
-          toDiag(mDiags,
-                 Search.first ? Search.first->getLocation()
-                              : mRegion->getBeginLoc(),
-                 clang::diag::note_parallel_reduction_unknown);
-          return false;
+          auto Search{mASTVars.findDecl(*(*I)->getMemory(), mASTToClient,
+                                        mDIMemoryMatcher)};
+          std::get<bool>(UnknownReduction) = true;
+          std::get<SortedVarMultiListT>(UnknownReduction)
+              .emplace(std::get<VarDecl *>(Search),
+                       std::get<DIMemory *>(Search));
         }
       } else {
-        auto CurrentKind = Red->getKind();
-        auto &ReductionList =
-            mDependenceInfo.get<trait::Reduction>()[CurrentKind];
-        clang::VarDecl *Status = nullptr;
-        if (!mASTVars.localize(**I, *TS.getNode(), mASTToClient,
-              mDIMemoryMatcher, ReductionList, &Status) &&
-            !IgnoreRedundant) {
-          toDiag(mDiags, mRegion->getBeginLoc(),
-                 clang::diag::warn_parallel_loop);
-          toDiag(mDiags, Status ? Status->getLocation() : mRegion->getBeginLoc(),
-                 clang::diag::note_parallel_localize_reduction_unable);
-          return false;
-        }
-        for (++I; I != EI; ++I) {
-          auto *Red = (**I).get<trait::Reduction>();
-          if (!Red || Red->getKind() != CurrentKind) {
-            if (!IgnoreRedundant) {
-              toDiag(mDiags, mRegion->getBeginLoc(),
-                clang::diag::warn_parallel_loop);
-              auto Search = mASTVars.findDecl(*(*I)->getMemory(), mASTToClient,
-                mDIMemoryMatcher);
-              toDiag(mDiags,
-                Search.first ? Search.first->getLocation()
-                : mRegion->getBeginLoc(),
-                clang::diag::note_parallel_reduction_unknown);
-              return false;
-            }
-          } else {
-            clang::VarDecl *Status = nullptr;
-            if (!mASTVars.localize(**I, *TS.getNode(),
-                  mASTToClient, mDIMemoryMatcher, ReductionList, &Status) &&
-                !IgnoreRedundant) {
-              toDiag(mDiags, mRegion->getBeginLoc(),
-                     clang::diag::warn_parallel_loop);
-              toDiag(mDiags,
-                     Status ? Status->getLocation() : mRegion->getBeginLoc(),
-                     clang::diag::note_parallel_localize_reduction_unable);
-              return false;
-            }
+        CurrentKind = Red->getKind();
+      }
+      SortedVarListT Stub;
+      auto &ReductionList{
+          CurrentKind != trait::DIReduction::RK_NoReduction
+              ? mDependenceInfo.get<trait::Reduction>()[CurrentKind]
+              : Stub};
+      auto &NotLocalized{
+          getErrorInfo(tsar::diag::note_parallel_localize_reduction_unable)};
+      if (!mASTVars.localize(
+              **I, *TS.getNode(), mASTToClient, mDIMemoryMatcher, ReductionList,
+              !IgnoreRedundant ? &std::get<SortedVarMultiListT>(NotLocalized)
+                               : nullptr) &&
+          !IgnoreRedundant)
+        std::get<bool>(NotLocalized) = true;
+      for (++I; I != EI; ++I) {
+        auto *Red{(**I).get<trait::Reduction>()};
+        if (!Red || Red->getKind() != CurrentKind) {
+          if (!IgnoreRedundant) {
+            auto Search{mASTVars.findDecl(*(*I)->getMemory(), mASTToClient,
+                                          mDIMemoryMatcher)};
+            std::get<bool>(UnknownReduction) = true;
+            std::get<SortedVarMultiListT>(UnknownReduction)
+                .emplace(std::get<VarDecl *>(Search),
+                         std::get<DIMemory *>(Search));
           }
+        } else if (!mASTVars.localize(
+                       **I, *TS.getNode(), mASTToClient, mDIMemoryMatcher,
+                       ReductionList,
+                       !IgnoreRedundant
+                           ? &std::get<SortedVarMultiListT>(NotLocalized)
+                           : nullptr) &&
+                   !IgnoreRedundant) {
+          std::get<bool>(NotLocalized) = true;
         }
       }
     } else if (Dptr.is_any<trait::Anti, trait::Flow>() &&
@@ -206,50 +229,51 @@ bool ClangDependenceAnalyzer::evaluateDependency() {
           return true;
         };
         if (setIf(trait::Flow{}) && setIf(trait::Anti{})) {
-          clang::VarDecl *Status = nullptr;
-          auto Search = mASTVars.findDecl(*(*TS.begin())->getMemory(),
-                                          mASTToClient, mDIMemoryMatcher);
-          if (Search.first &&
-            (Search.second == VariableCollector::CoincideLocal ||
+          auto Search{mASTVars.findDecl(*(*TS.begin())->getMemory(),
+                                        mASTToClient, mDIMemoryMatcher)};
+          if (std::get<VarDecl *>(Search) &&
+              (std::get<VariableCollector::DeclSearch>(Search) ==
+                   VariableCollector::CoincideLocal ||
               VariableCollector::CoincideGlobal)) {
             mDependenceInfo.get<trait::Dependence>().emplace(
-              std::string(Search.first->getName()), std::move(Info));
+                std::piecewise_construct,
+                std::forward_as_tuple(std::get<VarDecl *>(Search),
+                                      std::get<DIMemory *>(Search)),
+                std::forward_as_tuple(std::move(Info)));
             mInToLocalize.push_back(&TS);
             mOutToLocalize.push_back(&TS);
           } else if (!IgnoreRedundant) {
-            toDiag(mDiags, mRegion->getBeginLoc(),
-                   clang::diag::warn_parallel_loop);
-            if (Search.first)
-              toDiag(mDiags, Search.first->getLocation(),
-                     clang::diag::note_parallel_variable_not_analyzed);
-            return false;
+            auto &Status{
+                getErrorInfo(tsar::diag::note_parallel_variable_not_analyzed)};
+            std::get<bool>(Status) = true;
+            if (std::get<VarDecl *>(Search))
+              std::get<SortedVarMultiListT>(Status).emplace(
+                  std::get<VarDecl *>(Search), std::get<DIMemory *>(Search));
           }
         }
       }
     } else {
       if (Dptr.is<trait::SecondToLastPrivate>()) {
-        clang::VarDecl *Status = nullptr;
+        auto &Status{
+            getErrorInfo(tsar::diag::note_parallel_localize_private_unable)};
         if (!mASTVars.localize(TS, mASTToClient, mDIMemoryMatcher,
-              mDependenceInfo.get<trait::LastPrivate>(), &Status) &&
-            !IgnoreRedundant) {
-          toDiag(mDiags, mRegion->getBeginLoc(),
-                 clang::diag::warn_parallel_loop);
-          toDiag(mDiags, Status ? Status->getLocation() : mRegion->getBeginLoc(),
-                 clang::diag::note_parallel_localize_private_unable);
-          return false;
-        }
+                               mDependenceInfo.get<trait::LastPrivate>(),
+                               !IgnoreRedundant
+                                   ? &std::get<SortedVarMultiListT>(Status)
+                                   : nullptr) &&
+            !IgnoreRedundant)
+          std::get<bool>(Status) = true;
       }
       if (Dptr.is<trait::FirstPrivate>()) {
-        clang::VarDecl *Status = nullptr;
+        auto &Status{
+            getErrorInfo(tsar::diag::note_parallel_localize_private_unable)};
         if (!mASTVars.localize(TS, mASTToClient, mDIMemoryMatcher,
-              mDependenceInfo.get<trait::FirstPrivate>(), &Status) &&
-            !IgnoreRedundant) {
-          toDiag(mDiags, mRegion->getBeginLoc(),
-                 clang::diag::warn_parallel_loop);
-          toDiag(mDiags, Status ? Status->getLocation() : mRegion->getBeginLoc(),
-                 clang::diag::note_parallel_localize_private_unable);
-          return false;
-        }
+                               mDependenceInfo.get<trait::FirstPrivate>(),
+                               !IgnoreRedundant
+                                   ? &std::get<SortedVarMultiListT>(Status)
+                                   : nullptr) &&
+            !IgnoreRedundant)
+          std::get<bool>(Status) = true;
       }
     }
   }
@@ -257,53 +281,71 @@ bool ClangDependenceAnalyzer::evaluateDependency() {
   // clauses) does not break relation with original global variables used
   // in calls.
   SpanningTreeRelation<DIAliasTree *> STR(&mDIAT);
+  auto &NotLocalizedGlobal{
+      getErrorInfo(tsar::diag::note_parallel_localize_global_unable)};
   for (auto &NodeWithGlobal : mASTVars.GlobalRefs)
     for (auto *NodeWithSideEffect : DirectSideEffect)
       if (!STR.isUnreachable(NodeWithGlobal.first, NodeWithSideEffect)) {
-        toDiag(mDiags, mRegion->getBeginLoc(), clang::diag::warn_parallel_loop);
-        toDiag(mDiags,
-               NodeWithGlobal.second ? NodeWithGlobal.second->getLocation()
-                                     : mRegion->getBeginLoc(),
-               clang::diag::note_parallel_localize_global_unable);
-        return false;
+        std::get<bool>(NotLocalizedGlobal) = true;
+        std::get<SortedVarMultiListT>(NotLocalizedGlobal)
+            .emplace(NodeWithGlobal.second, nullptr);
       }
   // Check that traits for all variables referenced in the loop are properly
   // specified.
+  auto &NotAnalyzed{
+      getErrorInfo(tsar::diag::note_parallel_variable_not_analyzed)};
   for (auto &VarRef : mASTVars.CanonicalRefs)
     if (!mASTVars.CanonicalLocals.count(VarRef.first) &&
-        llvm::count(VarRef.second, nullptr)) {
-      toDiag(mDiags, mRegion->getBeginLoc(), clang::diag::warn_parallel_loop);
-      toDiag(mDiags, VarRef.first->getLocation(),
-             clang::diag::note_parallel_variable_not_analyzed)
-          << VarRef.first->getName();
-      return false;
+        !llvm::all_of(VarRef.second, [this](const auto &Derived) {
+          return Derived &&
+                     (Derived.Kind == VariableCollector::DK_Strong ||
+                      mGlobalOpts.IgnoreRedundantMemory ==
+                              GlobalOptions::IRMK_Bounded &&
+                          Derived.Kind == VariableCollector::DK_Bounded ||
+                      mGlobalOpts.IgnoreRedundantMemory ==
+                              GlobalOptions::IRMK_Partial &&
+                          Derived.Kind == VariableCollector::DK_Partial) ||
+                 !Derived && mGlobalOpts.IgnoreRedundantMemory ==
+                                 GlobalOptions::IRMK_Weak;
+        })) {
+      std::get<bool>(NotAnalyzed) = true;
+      std::get<SortedVarMultiListT>(NotAnalyzed).emplace(VarRef.first, nullptr);
     }
+  if (std::any_of(Errors.begin(), Errors.end(),
+                  [](auto &E) { return std::get<bool>(E); })) {
+    toDiag(mDiags, mRegion->getBeginLoc(), tsar::diag::warn_parallel_loop);
+    for (auto &&[Vars, Presence, Diag] : Errors) {
+      if (Presence)
+        if (Vars.empty()) {
+          toDiag(mDiags, mRegion->getBeginLoc(), Diag);
+        } else {
+          CanonicalDeclPtr<VarDecl> CurrentVar;
+          for (auto &V : Vars)
+            if (CanonicalDeclPtr<VarDecl> Var{V.get<AST>()};
+                Var != CurrentVar) {
+              toDiag(mDiags, Var->getLocation(), Diag);
+              CurrentVar = std::move(Var);
+            }
+        }
+    }
+    return false;
+  }
   return true;
 }
 
-bool ClangDependenceAnalyzer::evaluateDefUse() {
-  for (auto *TS : mInToLocalize) {
-    clang::VarDecl *Status = nullptr;
-    if (!mASTVars.localize(*TS, mASTToClient, mDIMemoryMatcher,
-          mDependenceInfo.get<trait::ReadOccurred>(), &Status)) {
-      toDiag(mDiags, mRegion->getBeginLoc(),
-             clang::diag::warn_parallel_loop);
-      toDiag(mDiags, Status ? Status->getLocation() : mRegion->getBeginLoc(),
-             clang::diag::note_parallel_localize_inout_unable);
-      return false;
-    }
-  }
-  for (auto *TS : mOutToLocalize) {
-    clang::VarDecl *Status = nullptr;
-    if (!mASTVars.localize(*TS, mASTToClient, mDIMemoryMatcher,
-          mDependenceInfo.get<trait::WriteOccurred>(), &Status)) {
-      toDiag(mDiags, mRegion->getBeginLoc(),
-             clang::diag::warn_parallel_loop);
-      toDiag(mDiags, Status ? Status->getLocation() : mRegion->getBeginLoc(),
-             clang::diag::note_parallel_localize_inout_unable);
-      return false;
-    }
-  }
+bool ClangDependenceAnalyzer::evaluateDefUse(SortedVarMultiListT *Errors) {
+  bool IsOk{true};
+  SortedVarMultiListT Stub;
+  if (!Errors)
+    Errors = &Stub;
+  for (auto *TS : mInToLocalize)
+    IsOk &=
+        mASTVars.localize(*TS, mASTToClient, mDIMemoryMatcher,
+                          mDependenceInfo.get<trait::ReadOccurred>(), Errors);
+  for (auto *TS : mOutToLocalize)
+    IsOk &=
+        mASTVars.localize(*TS, mASTToClient, mDIMemoryMatcher,
+                          mDependenceInfo.get<trait::WriteOccurred>(), Errors);
   mDependenceInfo.get<trait::ReadOccurred>().insert(
       mDependenceInfo.get<trait::FirstPrivate>().begin(),
       mDependenceInfo.get<trait::FirstPrivate>().end());
@@ -314,5 +356,20 @@ bool ClangDependenceAnalyzer::evaluateDefUse() {
     mDependenceInfo.get<trait::WriteOccurred>().insert(Red.begin(), Red.end());
     mDependenceInfo.get<trait::ReadOccurred>().insert(Red.begin(), Red.end());
   }
-  return true;
+  if (!IsOk) {
+    toDiag(mDiags, mRegion->getBeginLoc(), tsar::diag::warn_parallel_loop);
+    if (Errors->empty()) {
+      toDiag(mDiags, mRegion->getBeginLoc(),
+             tsar::diag::note_parallel_localize_inout_unable);
+    } else {
+      CanonicalDeclPtr<VarDecl> CurrentVar;
+      for (auto &V : *Errors)
+        if (CanonicalDeclPtr<VarDecl> Var{V.get<AST>()}; Var != CurrentVar) {
+          toDiag(mDiags, Var->getLocation(),
+                 tsar::diag::note_parallel_localize_inout_unable);
+          CurrentVar = std::move(Var);
+        }
+    }
+  }
+  return IsOk;
 }

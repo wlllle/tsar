@@ -65,24 +65,32 @@ struct DILocationMapInfo {
     return DenseMapInfo<decltype(Pair)>::getHashValue(Pair);
   }
   static bool isEqual(const DILocation *LHS, const DILocation *RHS) {
+    if (LHS == RHS)
+      return true;
     auto TK = getTombstoneKey();
     auto EK = getEmptyKey();
-    llvm::SmallString<128> LHSPath, RHSPath;
-    return LHS == RHS ||
-      RHS != TK && LHS != TK && RHS != EK && LHS != EK &&
-      LHS->getLine() == RHS->getLine() &&
-      LHS->getColumn() == RHS->getColumn() &&
-      tsar::getAbsolutePath(*LHS->getScope(), LHSPath) ==
-        tsar::getAbsolutePath(*RHS->getScope(), RHSPath);
+    if (RHS == TK || LHS == TK || RHS == EK || LHS == EK ||
+        LHS->getLine() != RHS->getLine() ||
+        LHS->getColumn() != RHS->getColumn())
+      return false;
+    sys::fs::UniqueID LHSId, RHSId;
+    SmallString<128> LHSPath, RHSPath;
+    return !sys::fs::getUniqueID(
+               tsar::getAbsolutePath(*LHS->getScope(), LHSPath), LHSId) &&
+           !sys::fs::getUniqueID(
+               tsar::getAbsolutePath(*RHS->getScope(), RHSPath), RHSId) &&
+           LHSId == RHSId;
   }
   static bool isEqual(const clang::PresumedLoc &LHS, const DILocation *RHS) {
-    llvm::SmallString<128> LHSPath, RHSPath;
-    return !isEqual(RHS, getTombstoneKey()) &&
-      !isEqual(RHS, getEmptyKey()) &&
-      LHS.getLine() == RHS->getLine() &&
-      LHS.getColumn() == RHS->getColumn() &&
-      tsar::getNativePath(LHS.getFilename(), LHSPath) ==
-      tsar::getAbsolutePath(*RHS->getScope(), RHSPath);
+    if (isEqual(RHS, getTombstoneKey()) || isEqual(RHS, getEmptyKey()) ||
+        LHS.getLine() != RHS->getLine() || LHS.getColumn() != RHS->getColumn())
+      return false;
+    sys::fs::UniqueID LHSId, RHSId;
+    SmallString<128> LHSPath, RHSPath;
+    return !sys::fs::getUniqueID(LHS.getFilename(), LHSId) &&
+           !sys::fs::getUniqueID(
+               tsar::getAbsolutePath(*RHS->getScope(), RHSPath), RHSId) &&
+           LHSId == RHSId;
   }
 };
 }
@@ -90,34 +98,39 @@ struct DILocationMapInfo {
 namespace tsar {
 /// This is a base class which is inherited to match different entities (loops,
 /// variables, etc.).
-///
-/// \tparam IRPtrTy Pointer to IR entity.
-/// \tparam ASTPtrTy Pointer to AST entity.
-template<class IRPtrTy, class ASTPtrTy,
+template<class IRItemTy, class ASTItemTy,
   class IRLocationTy = llvm::DILocation *,
   class IRLocationMapInfo = llvm::DILocationMapInfo,
   class ASTLocationTy = unsigned,
   class ASTLocationMapInfo = llvm::DenseMapInfo<ASTLocationTy>,
   class MatcherTy = Bimap<
-    bcl::tagged<ASTPtrTy, AST>, bcl::tagged<IRPtrTy, IR>>,
-  class UnmatchedASTSetTy = std::set<ASTPtrTy>>
+    bcl::tagged<ASTItemTy, AST>, bcl::tagged<IRItemTy, IR>>,
+  class UnmatchedASTSetTy = llvm::DenseSet<ASTItemTy>>
 class MatchASTBase {
 public:
-  typedef MatcherTy Matcher;
+  using Matcher = MatcherTy;
 
-  typedef UnmatchedASTSetTy UnmatchedASTSet;
+  using UnmatchedASTSet = UnmatchedASTSetTy;
 
   /// This is a map from entity location to a queue of IR entities.
-  typedef llvm::DenseMap<IRLocationTy,
-    llvm::TinyPtrVector<IRPtrTy>, IRLocationMapInfo> LocToIRMap;
+  using LocToIRMap =
+      llvm::DenseMap<IRLocationTy,
+                     std::conditional_t<std::is_pointer_v<IRItemTy>,
+                                        llvm::TinyPtrVector<IRItemTy>,
+                                        llvm::SmallVector<IRItemTy, 1>>,
+                     IRLocationMapInfo>;
 
   /// \brief This is a map from location in a source file to an queue of AST
   /// entities, which are associated with this location.
   ///
   /// The key in this map is a raw encoding for location.
   /// To decode it use SourceLocation::getFromRawEncoding() method.
-  typedef llvm::DenseMap<ASTLocationTy,
-    llvm::TinyPtrVector<ASTPtrTy>, ASTLocationMapInfo> LocToASTMap;
+  using LocToASTMap =
+      llvm::DenseMap<ASTLocationTy,
+                     std::conditional_t<std::is_pointer_v<ASTItemTy>,
+                                        llvm::TinyPtrVector<ASTItemTy>,
+                                        llvm::SmallVector<ASTItemTy, 1>>,
+                     ASTLocationMapInfo>;
 
   /// \brief Constructor.
   ///
@@ -138,7 +151,7 @@ public:
   /// Finds low-level representation of an entity at the specified location.
   ///
   /// \return LLVM IR for an entity or `nullptr`.
-  IRPtrTy findIRForLocation(clang::SourceLocation Loc) {
+  IRItemTy findIRForLocation(clang::SourceLocation Loc) {
     auto LocItr = findItrForLocation(Loc);
     if (LocItr == mLocToIR->end())
       return nullptr;
@@ -162,8 +175,11 @@ public:
   /// This matches entities from mLocToMacro and mLocToIR. It is recommended
   /// to evaluate at first all entities outside macros and then consider macros
   /// separately.
+  ///
+  /// \param [in] Strict If it is true, macros, containing exactly a single
+  /// item, are processed.
   void matchInMacro(llvm::Statistic &NumMatch, llvm::Statistic &NumNonMatchAST,
-      llvm::Statistic &NumNonMatchIR) {
+      llvm::Statistic &NumNonMatchIR, bool Strict = false) {
     for (auto &InMacro : *mLocToMacro) {
       clang:: PresumedLoc PLoc = mSrcMgr->getPresumedLoc(
         clang::SourceLocation::getFromRawEncoding(InMacro.first), false);
@@ -173,7 +189,8 @@ public:
       // a macro. Such entities are not going to be evaluated due to necessity
       // of additional analysis of AST.
       if (IREntityItr == mLocToIR->end() ||
-        IREntityItr->second.size() != InMacro.second.size()) {
+          IREntityItr->second.size() != InMacro.second.size() ||
+          Strict && InMacro.second.size() > 1) {
         NumNonMatchAST += InMacro.second.size();
         while (!InMacro.second.empty()) {
           mUnmatchedAST->insert(InMacro.second.back());
